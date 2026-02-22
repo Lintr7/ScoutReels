@@ -17,6 +17,7 @@ Experience Scout live in action (best viewed on a laptop):
 
 **Backend:**
 - FastAPI
+- Supabase (For database and authentication)
 - Railway (Deployment), Used AWS Elastic Beanstalk before
 - Python (for web scraping and OpenAI sentiment analysis)
 - Marketaux, Finnhub, and Alpaca API calls
