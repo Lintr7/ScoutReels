@@ -30,4 +30,4 @@ During development, I encountered several challenges:
 - **AWS Elastic Beanstalk:** Configuring and restructuring files to meet AWS deployment requirements was definitely complicated.
 - **API Communication:** Initially, our API endpoint calls failed due to mixed content issues (HTTPS on the frontend vs. HTTP on the backend). I resolved this by implementing a secure proxy to align both endpoints under HTTPS. Currently, Scout is deployed Railway due to its ease of use.
 - **API Optimation:** Looking for the best API providers with generous free tiers that gave all the information we wanted wasn't easy. I also implemented an in-memory cache to drastically reduce API calls.
-- - **API Design:** Figuring out the cache strategy and rate limiting logic
+- **API Design:** Figuring out the cache strategy and rate limiting logic
