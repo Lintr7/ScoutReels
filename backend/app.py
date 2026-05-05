@@ -11,7 +11,8 @@ from datetime import datetime, timedelta
 import urllib.parse
 import asyncio
 from typing import Optional, Dict, Any
-import time
+import json
+import redis
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -31,6 +32,40 @@ if not OPENAI_API_KEY:
 
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
+# Redis setup
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+
+# Cache TTLs in seconds
+CACHE_SECONDS = {
+   "news": 24 * 3600,
+   "finnhub": 24 * 3600,
+   "search": 2 * 3600,
+   "stocks": 360,
+}
+
+CACHE_TIMES = {k: v / 3600 for k, v in CACHE_SECONDS.items()}
+
+def get_cached_data(key: str, cache_type: str):
+   try:
+       data = redis_client.get(key)
+       if data:
+           print(f"Cache HIT for {cache_type} key: {key}")
+           return json.loads(data)
+       print(f"Cache MISS for {cache_type} key: {key}")
+       return None
+   except Exception as e:
+       print(f"Redis get error: {e}")
+       return None
+
+def set_cached_data(key: str, data, cache_type: str):
+   try:
+       ttl = CACHE_SECONDS.get(cache_type, 3600)
+       redis_client.setex(key, ttl, json.dumps(data))
+       print(f"Cache SET for {cache_type} key: {key} (TTL: {ttl}s)")
+   except Exception as e:
+       print(f"Redis set error: {e}")
+
 app = FastAPI(
    title="News Sentiment API",
    max_request_size=1_000_000
@@ -40,54 +75,7 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Cache times for each API
-CACHE_TIMES = {
-   "news": 24,
-   "finnhub": 24,
-   "search": 2,
-   "stocks": 0.1
-}
-CACHE_SECONDS = {key: hours * 3600 for key, hours in CACHE_TIMES.items()}
-
-# Cache dictionaries
-news_cache = {}
-finnhub_cache = {}
-search_cache = {}
-stocks_cache = {}
-
-def is_cache_valid(cache_entry: dict, cache_type: str) -> bool:
-   if not cache_entry:
-       return False
-   expiration_seconds = CACHE_SECONDS.get(cache_type, 3600)
-   return (time.time() - cache_entry["timestamp"]) < expiration_seconds
-
-
-def get_cached_data(cache_dict: dict, key: str, cache_type: str):
-   cache_entry = cache_dict.get(key)
-   if cache_entry and is_cache_valid(cache_entry, cache_type):
-       hours_valid = CACHE_TIMES.get(cache_type, 1)
-       print(f"Cache HIT for {cache_type} key: {key} (valid for {hours_valid}h)")
-       return cache_entry["data"]
-   elif cache_entry:
-       del cache_dict[key]
-       print(f"Cache EXPIRED for {cache_type} key: {key}")
-   else:
-       print(f"Cache MISS for {cache_type} key: {key}")
-   return None
-
-
-def set_cached_data(cache_dict: dict, key: str, data, cache_type: str):
-   cache_dict[key] = {
-       "data": data,
-       "timestamp": time.time()
-   }
-   hours_valid = CACHE_TIMES.get(cache_type, 1)
-   print(f"Cache SET for {cache_type} key: {key} (valid for {hours_valid}h)")
-
 FRONTEND_ORIGINS = [
-   #"http://localhost:5173",
-   #"http://127.0.0.1:5173",
-   #"https://scout-new.vercel.app",
    "https://scout-reels.vercel.app",
 ]
 
@@ -105,13 +93,8 @@ class CompanyRequest(BaseModel):
    company: str
 
 
-# ============================================================================
-# FIX 2: Use validation functions in ALL endpoints
-# ============================================================================
-
-
 @app.post("/search")
-@limiter.limit("20/minute")  # Lower limit for expensive OpenAI calls
+@limiter.limit("20/minute")
 @limiter.limit("300/day")
 def handle_search(payload: CompanyRequest, request: Request):
    """POST /search - OpenAI sentiment analysis (2 hour cache)"""
@@ -119,20 +102,17 @@ def handle_search(payload: CompanyRequest, request: Request):
        company = validate_search_request(request, payload.company)
       
        cache_key = f"search_{company.lower()}"
-       cached_result = get_cached_data(search_cache, cache_key, "search")
+       cached_result = get_cached_data(cache_key, "search")
        if cached_result:
            return cached_result
-
 
        search_url = f"https://www.google.com/search?q={company}+news&tbm=nws"
        resp = requests.get(search_url, timeout=10.0)
        soup = BeautifulSoup(resp.content, "html.parser")
        headlines = [h3.get_text(strip=True) for h3 in soup.find_all("h3")][:10]
 
-
        if not headlines:
            raise HTTPException(status_code=404, detail="No news found")
-
 
        prompt = (
            f"Analyze the sentiment of the following news headlines about {company}'s stock. "
@@ -141,7 +121,6 @@ def handle_search(payload: CompanyRequest, request: Request):
            "news examples and the average sentiment score as a number. Output should be in the exact format of: "
            "Average Sentiment Score: _/10. Then the summary."
        )
-
 
        try:
            ai_response = client.chat.completions.create(
@@ -156,25 +135,20 @@ def handle_search(payload: CompanyRequest, request: Request):
            print(f"OpenAI API error: {ai_error}")
            sentiment_analysis = "Unable to analyze sentiment due to API error."
 
-
        result = {
            "sentiment": sentiment_analysis,
            "headlines": headlines,
            "company": company,
        }
 
-
-       set_cached_data(search_cache, cache_key, result, "search")
+       set_cached_data(cache_key, result, "search")
        return result
-
 
    except HTTPException:
        raise
    except Exception as e:
        print(f"Error in /search: {type(e).__name__}: {str(e)}")
        raise HTTPException(status_code=500, detail="Internal server error")
-
-
 
 
 @app.get("/stocks/{symbol}")
@@ -193,10 +167,9 @@ async def get_stock_data(
        )
       
        cache_key = f"stocks_{symbol}_{start}_{end}_{timeframe}"
-       cached_result = get_cached_data(stocks_cache, cache_key, "stocks")
+       cached_result = get_cached_data(cache_key, "stocks")
        if cached_result:
            return cached_result
-
 
        ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
        ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
@@ -222,8 +195,7 @@ async def get_stock_data(
            response = await client_http.get(url, headers=headers, params=params)
            response.raise_for_status()
            result = response.json()
-          
-           set_cached_data(stocks_cache, cache_key, result, "stocks")
+           set_cached_data(cache_key, result, "stocks")
            return result
   
    except HTTPException:
@@ -233,8 +205,6 @@ async def get_stock_data(
    except Exception as e:
        print(f"Error in /stocks: {type(e).__name__}")
        raise HTTPException(status_code=500, detail="Internal server error")
-
-
 
 
 MARKETAUX_API_KEY = os.getenv("MARKETAUX_API_KEY")
@@ -247,15 +217,14 @@ async def get_news(
    symbol: str,
    company_name: str = Query(..., alias="companyName"),
 ):
-   """MarketAux news (10 hour cache)"""
+   """MarketAux news (24 hour cache)"""
    try:
        symbol, canonical_name = validate_news_request(request, symbol, company_name)
       
        cache_key = f"news_{symbol.lower()}_{canonical_name.lower()}"
-       cached_result = get_cached_data(news_cache, cache_key, "news")
+       cached_result = get_cached_data(cache_key, "news")
        if cached_result:
            return cached_result
-
 
        thirty_days_ago = datetime.now() - timedelta(days=90)
        date_string = thirty_days_ago.strftime('%Y-%m-%d')
@@ -278,8 +247,7 @@ async def get_news(
            response = await client_http.get(url)
            response.raise_for_status()
            result = response.json()
-          
-           set_cached_data(news_cache, cache_key, result, "news")
+           set_cached_data(cache_key, result, "news")
            return result
   
    except HTTPException:
@@ -378,7 +346,7 @@ async def get_finnhub_data(
    symbol: str,
    company_name: Optional[str] = Query(None),
 ):
-   """Finnhub earnings/metrics (10 hour cache)"""
+   """Finnhub earnings/metrics (24 hour cache)"""
    try:
        symbol, canonical_name = validate_finnhub_request(request, symbol, company_name)
       
@@ -386,7 +354,7 @@ async def get_finnhub_data(
            raise HTTPException(status_code=500, detail="Finnhub API key not configured")
       
        cache_key = f"finnhub_{symbol.lower()}_{canonical_name.lower()}"
-       cached_result = get_cached_data(finnhub_cache, cache_key, "finnhub")
+       cached_result = get_cached_data(cache_key, "finnhub")
        if cached_result:
            return cached_result
       
@@ -454,11 +422,10 @@ async def get_finnhub_data(
            if sum(1 for field in earnings_fields if quarter[field] == 0) == 3
        )
 
-
        if (len(response_data["company_metrics"]["logo"]) > 0 and
            len(response_data["company_metrics"]["industry"]) > 0 and
            count <= 3 and missing_earnings_count <= 2):
-           set_cached_data(finnhub_cache, cache_key, response_data, "finnhub")
+           set_cached_data(cache_key, response_data, "finnhub")
       
        return response_data
   
@@ -471,40 +438,29 @@ async def get_finnhub_data(
 
 @app.get("/cache/stats")
 def get_cache_stats():
-   def get_cache_info(cache_dict, name):
-       total_entries = len(cache_dict)
-       valid_entries = sum(1 for entry in cache_dict.values() if is_cache_valid(entry, name))
-       expired_entries = total_entries - valid_entries
-       cache_hours = CACHE_TIMES.get(name, 1)
+   try:
+       info = redis_client.info()
+       keys = redis_client.keys("*")
        return {
-           "name": name,
-           "cache_hours": cache_hours,
-           "total_entries": total_entries,
-           "valid_entries": valid_entries,
-           "expired_entries": expired_entries
+           "cache_times": CACHE_TIMES,
+           "total_keys": len(keys),
+           "redis_used_memory": info.get("used_memory_human"),
+           "redis_connected_clients": info.get("connected_clients"),
+           "keys": keys
        }
-  
-   return {
-       "cache_times": CACHE_TIMES,
-       "caches": [
-           get_cache_info(news_cache, "news"),
-           get_cache_info(finnhub_cache, "finnhub"),
-           get_cache_info(search_cache, "search"),
-           get_cache_info(stocks_cache, "stocks")
-       ]
-   }
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Redis error: {e}")
 
 
 @app.get("/cache/clear")
 def clear_all_caches():
-   news_cache.clear()
-   finnhub_cache.clear()
-   search_cache.clear()
-   stocks_cache.clear()
-   return {"message": "All caches cleared"}
+   try:
+       redis_client.flushdb()
+       return {"message": "All caches cleared"}
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Redis error: {e}")
 
 
 @app.get("/test")
 def test():
    return {"message": "FastAPI server is running!", "status": "OK"}
-
