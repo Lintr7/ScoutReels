@@ -106,10 +106,15 @@ def handle_search(payload: CompanyRequest, request: Request):
        if cached_result:
            return cached_result
 
-       search_url = f"https://www.google.com/search?q={company}+news&tbm=nws"
-       resp = requests.get(search_url, timeout=10.0)
-       soup = BeautifulSoup(resp.content, "html.parser")
-       headlines = [h3.get_text(strip=True) for h3 in soup.find_all("h3")][:10]
+       headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+       search_url = f"https://news.google.com/rss/search?q={company}+stock&hl=en-US&gl=US&ceid=US:en"
+       resp = requests.get(search_url, headers=headers, timeout=10.0)
+       soup = BeautifulSoup(resp.content, "xml")
+       items = soup.find_all("item")
+       headlines = [item.find("title").get_text(strip=True) for item in items][:10]
 
        if not headlines:
            raise HTTPException(status_code=404, detail="No news found")

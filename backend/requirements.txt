@@ -8,3 +8,4 @@ python-dotenv==1.0.0
 httpx==0.25.2
 slowapi==0.1.9
 redis==5.0.1
+lxml==4.9.3
